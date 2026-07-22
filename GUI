@@ -1,0 +1,376 @@
+"""Grafische Oberflaeche fuer das GDV-Suchtool.
+
+Startet die Suche aus script.py in einem Hintergrund-Thread (damit die Oberflaeche
+nicht einfriert) und zeigt jede Fundstelle live in einer Liste an. Doppelklick auf
+eine Zeile oeffnet den Windows-Explorer und markiert die betreffende Datei/ZIP -
+so sieht man sofort, WO die Datei liegt.
+
+Benoetigt keine zusaetzlichen Pakete (nur Python-Standardbibliothek).
+Voraussetzung: diese Datei liegt im selben Ordner wie script.py.
+
+Start:  python such_gui.py     (oder Doppelklick, wenn .py mit Python verknuepft ist)
+"""
+
+import os
+import sys
+import queue
+import threading
+import subprocess
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Suchmaschine (gemeinsame Quelle mit dem Kommandozeilen-Tool)
+import script
+
+
+def _split_terms(raw):
+    """Zerlegt eine Eingabe an Komma, Semikolon, Zeilenumbruch und Leerzeichen."""
+    for sep in (",", ";", "\n", "\t"):
+        raw = raw.replace(sep, " ")
+    seen, out = set(), []
+    for t in raw.split():
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _fs_path(location):
+    """Aus einer Fundstelle den echten Datei-Pfad ableiten.
+
+    Fundstellen sehen so aus:  C:\\...\\lieferung.zip::inhalt_gdv.xml.done
+    Auf der Platte liegt aber die ZIP - alles vor '::' ist der oeffenbare Pfad.
+    """
+    return location.split("::", 1)[0]
+
+
+def _reveal_in_explorer(location):
+    """Oeffnet den Datei-Explorer und markiert die Datei (Windows) bzw. den Ordner."""
+    path = os.path.normpath(_fs_path(location))
+    try:
+        if sys.platform.startswith("win"):
+            # /select markiert die Datei im geoeffneten Ordner
+            subprocess.run(["explorer", "/select,", path])
+        elif sys.platform == "darwin":
+            subprocess.run(["open", "-R", path])
+        else:
+            subprocess.run(["xdg-open", os.path.dirname(path) or "."])
+    except Exception as e:
+        messagebox.showerror("Konnte nicht oeffnen", f"{path}\n\n{e}")
+
+
+# ---------------------------------------------------------------------------
+# Hintergrund-Suche: laeuft in eigenem Thread, meldet Ereignisse ueber eine Queue
+# ---------------------------------------------------------------------------
+
+def _run_search(params, out_queue, cancel_event):
+    try:
+        terms = params["terms"]
+        ic = params["ignore_case"]
+
+        # Suchkonfiguration inkl. verlustfreiem Byte-Vorfilter. Threads teilen sich
+        # den Prozess, daher wird die Konfiguration EINMAL im gemeinsamen Modul gesetzt.
+        script._MATCHERS = script.make_matchers(terms, params["and_terms"], ic)
+
+        paths = script.gather_paths(
+            params["root"], params["since_year"], params["vertriebe"], params["konzern"]
+        )
+        total = len(paths)
+        out_queue.put(("total", total))
+        if total == 0:
+            out_queue.put(("done", {"terms": terms, "counts": {}, "errors": 0}))
+            return
+
+        counts = {t: 0 for t in terms}
+        error_count = 0
+        processed = 0
+        total_bytes = 0
+
+        # ThreadPool statt ProcessPool: kein Prozess-Spawn, keine Speicher-Kopien je
+        # Worker -> viel schonender fuer den Laptop. Die Arbeit ist ohnehin vor allem
+        # I/O (Dateien von OneDrive/Platte lesen), das ueberlappen Threads gut.
+        with ThreadPoolExecutor(max_workers=params["workers"]) as executor:
+            futures = {executor.submit(script.scan_path, p): p for p in paths}
+            for future in as_completed(futures):
+                if cancel_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    out_queue.put(("cancelled", processed))
+                    return
+                processed += 1
+                hits, errors, bytes_read = future.result()
+                total_bytes += bytes_read
+                error_count += len(errors)
+                for term_str, location, line in hits:
+                    counts[term_str] = counts.get(term_str, 0) + 1
+                    out_queue.put(("hit", (term_str, location, line)))
+                out_queue.put(("progress", (processed, total, total_bytes)))
+
+        out_queue.put(("done", {"terms": terms, "counts": counts, "errors": error_count}))
+    except Exception as e:  # pragma: no cover - Schutz gegen Absturz des Threads
+        out_queue.put(("fatal", str(e)))
+
+
+# ---------------------------------------------------------------------------
+# Oberflaeche
+# ---------------------------------------------------------------------------
+
+class SuchApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("GDV-Suchtool")
+        self.geometry("1000x680")
+        self.minsize(820, 560)
+
+        self.queue = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker = None
+        self.seen_locations = set()
+        self.hit_count = 0
+
+        self._build_widgets()
+        self.after(100, self._poll_queue)
+
+    # -- Aufbau der Eingabefelder -------------------------------------------
+    def _build_widgets(self):
+        pad = {"padx": 6, "pady": 3}
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="x")
+        frm.columnconfigure(1, weight=1)
+
+        # Wurzelordner + Durchsuchen
+        ttk.Label(frm, text="Ordner:").grid(row=0, column=0, sticky="w", **pad)
+        self.var_root = tk.StringVar(value=script.DEFAULT_ROOT_DIRECTORY)
+        ttk.Entry(frm, textvariable=self.var_root).grid(row=0, column=1, sticky="ew", **pad)
+        ttk.Button(frm, text="Durchsuchen…", command=self._pick_folder).grid(row=0, column=2, **pad)
+
+        # Suchbegriffe
+        ttk.Label(frm, text="Nummer(n):").grid(row=1, column=0, sticky="w", **pad)
+        self.var_terms = tk.StringVar(value=script.DEFAULT_SEARCH_STRING)
+        e = ttk.Entry(frm, textvariable=self.var_terms)
+        e.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+        e.focus()
+
+        # Konzern
+        ttk.Label(frm, text="Konzern (optional):").grid(row=2, column=0, sticky="w", **pad)
+        self.var_konzern = tk.StringVar(value=" ".join(script.DEFAULT_KONZERN_FILTER))
+        ttk.Entry(frm, textvariable=self.var_konzern).grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
+
+        # UND-Begriffe
+        ttk.Label(frm, text="UND-Begriffe (optional):").grid(row=3, column=0, sticky="w", **pad)
+        self.var_and = tk.StringVar(value=" ".join(script.DEFAULT_AND_TERMS))
+        ttk.Entry(frm, textvariable=self.var_and).grid(row=3, column=1, columnspan=2, sticky="ew", **pad)
+
+        # Zeile mit Jahr / Vertrieb / Workers / ignore-case
+        opts = ttk.Frame(frm)
+        opts.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+
+        ttk.Label(opts, text="Ab Jahr:").pack(side="left")
+        self.var_year = tk.StringVar(value=str(script.DEFAULT_SINCE_YEAR or ""))
+        ttk.Entry(opts, textvariable=self.var_year, width=7).pack(side="left", padx=(4, 14))
+
+        ttk.Label(opts, text="Vertrieb:").pack(side="left")
+        self.var_vertrieb = tk.StringVar(value=" ".join(script.DEFAULT_VERTRIEBE or []))
+        ttk.Entry(opts, textvariable=self.var_vertrieb, width=18).pack(side="left", padx=(4, 14))
+
+        ttk.Label(opts, text="Prozesse:").pack(side="left")
+        self.var_workers = tk.StringVar(value=str(script.default_workers()))
+        ttk.Spinbox(opts, from_=1, to=64, textvariable=self.var_workers, width=5).pack(side="left", padx=(4, 4))
+        ttk.Label(opts, text="(weniger = Laptop bleibt fluessiger)").pack(side="left", padx=(0, 14))
+
+        self.var_ic = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Gross/klein egal", variable=self.var_ic).pack(side="left")
+
+        # Buttons
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.btn_search = ttk.Button(btns, text="🔍  Suchen", command=self._start_search)
+        self.btn_search.pack(side="left")
+        self.btn_cancel = ttk.Button(btns, text="Abbrechen", command=self._cancel_search, state="disabled")
+        self.btn_cancel.pack(side="left", padx=6)
+
+        # Fortschritt
+        prog = ttk.Frame(self, padding=(10, 0))
+        prog.pack(fill="x")
+        self.progress = ttk.Progressbar(prog, mode="determinate")
+        self.progress.pack(fill="x", side="left", expand=True)
+        self.var_status = tk.StringVar(value="Bereit.")
+        ttk.Label(prog, textvariable=self.var_status).pack(side="left", padx=10)
+
+        # Ergebnis-Tabelle
+        res = ttk.Frame(self, padding=10)
+        res.pack(fill="both", expand=True)
+        cols = ("nummer", "ort")
+        self.tree = ttk.Treeview(res, columns=cols, show="headings", selectmode="browse")
+        self.tree.heading("nummer", text="Nummer")
+        self.tree.heading("ort", text="Fundstelle  (Doppelklick = Ordner oeffnen)")
+        self.tree.column("nummer", width=140, anchor="w", stretch=False)
+        self.tree.column("ort", width=760, anchor="w")
+        vsb = ttk.Scrollbar(res, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.tree.bind("<Double-1>", self._on_open)
+        self._menu = tk.Menu(self, tearoff=0)
+        self._menu.add_command(label="Ordner oeffnen (Datei markieren)", command=self._on_open)
+        self._menu.add_command(label="Pfad kopieren", command=self._copy_path)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        # Zusammenfassung unten
+        self.var_summary = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.var_summary, padding=(10, 4), anchor="w").pack(fill="x")
+
+    # -- Aktionen ------------------------------------------------------------
+    def _pick_folder(self):
+        start = self.var_root.get() if os.path.isdir(self.var_root.get()) else os.path.expanduser("~")
+        chosen = filedialog.askdirectory(initialdir=start, title="Suchordner waehlen")
+        if chosen:
+            self.var_root.set(chosen)
+
+    def _start_search(self):
+        root = self.var_root.get().strip()
+        if not os.path.exists(root):
+            messagebox.showerror("Ordner fehlt", f"Pfad existiert nicht:\n{root}")
+            return
+        terms = _split_terms(self.var_terms.get())
+        if not terms:
+            messagebox.showerror("Keine Nummer", "Bitte mindestens eine zu suchende Nummer eingeben.")
+            return
+
+        try:
+            year = int(self.var_year.get()) if self.var_year.get().strip() else None
+        except ValueError:
+            messagebox.showerror("Jahr ungueltig", "Ab-Jahr muss eine Zahl sein (oder leer).")
+            return
+        try:
+            workers = max(1, int(self.var_workers.get()))
+        except ValueError:
+            workers = os.cpu_count() or 4
+
+        params = {
+            "root": root,
+            "terms": terms,
+            "konzern": _split_terms(self.var_konzern.get()),
+            "and_terms": _split_terms(self.var_and.get()),
+            "since_year": year,
+            "vertriebe": _split_terms(self.var_vertrieb.get()) or None,
+            "workers": workers,
+            "ignore_case": self.var_ic.get(),
+        }
+
+        # Oberflaeche zuruecksetzen
+        self.tree.delete(*self.tree.get_children())
+        self.seen_locations.clear()
+        self.hit_count = 0
+        self.var_summary.set("")
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.start(12)
+        self.var_status.set("Sammle Dateien…")
+        self.btn_search.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+
+        self.cancel_event.clear()
+        self.worker = threading.Thread(
+            target=_run_search, args=(params, self.queue, self.cancel_event), daemon=True
+        )
+        self.worker.start()
+
+    def _cancel_search(self):
+        self.cancel_event.set()
+        self.var_status.set("Abbruch angefordert…")
+        self.btn_cancel.configure(state="disabled")
+
+    def _selected_location(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self.tree.item(sel[0], "values")[1]
+
+    def _on_open(self, event=None):
+        loc = self._selected_location()
+        if loc:
+            _reveal_in_explorer(loc)
+
+    def _copy_path(self):
+        loc = self._selected_location()
+        if loc:
+            self.clipboard_clear()
+            self.clipboard_append(_fs_path(loc))
+
+    def _on_right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            self._menu.tk_popup(event.x_root, event.y_root)
+
+    # -- Ereignisse aus dem Such-Thread abholen -----------------------------
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                self._handle_event(kind, payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _handle_event(self, kind, payload):
+        if kind == "total":
+            total = payload
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=max(total, 1), value=0)
+            self.var_status.set(f"{total} Dateien gefunden – suche…")
+        elif kind == "hit":
+            term_str, location, _line = payload
+            if location not in self.seen_locations:
+                self.seen_locations.add(location)
+                self.hit_count += 1
+                self.tree.insert("", "end", values=(term_str, location))
+        elif kind == "progress":
+            processed, total, total_bytes = payload
+            self.progress.configure(value=processed)
+            gb = total_bytes / (1024 ** 3)
+            self.var_status.set(
+                f"{processed}/{total} Dateien · {self.hit_count} Fundstelle(n) · {gb:.2f} GB"
+            )
+        elif kind == "done":
+            self._finish(payload, cancelled=False)
+        elif kind == "cancelled":
+            self._finish({"terms": [], "counts": {}, "errors": 0}, cancelled=True)
+        elif kind == "fatal":
+            self.progress.stop()
+            self.progress.configure(mode="determinate", value=0)
+            self._reset_buttons()
+            messagebox.showerror("Fehler bei der Suche", payload)
+            self.var_status.set("Fehler.")
+
+    def _finish(self, info, cancelled):
+        self.progress.stop()
+        self._reset_buttons()
+        if cancelled:
+            self.var_status.set("Abgebrochen.")
+            return
+        parts = []
+        for t in info["terms"]:
+            c = info["counts"].get(t, 0)
+            parts.append(f"{t}: {c}" if c else f"{t}: 0")
+        summ = "   |   ".join(parts) if parts else "Keine Nummern."
+        if info.get("errors"):
+            summ += f"    ({info['errors']} Datei(en) nicht lesbar)"
+        self.var_summary.set("Ergebnis:   " + summ)
+        self.var_status.set(f"Fertig. {self.hit_count} Fundstelle(n).")
+        if self.hit_count == 0:
+            messagebox.showinfo("Kein Treffer", "Keine der gesuchten Nummern wurde gefunden.")
+
+    def _reset_buttons(self):
+        self.btn_search.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
+
+
+def main():
+    app = SuchApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
